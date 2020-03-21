@@ -7,7 +7,7 @@
 
 
 import { fieldTagNames, fieldTagTypes, fieldTypeNames, geoKeyNames } from './globals';
-import { assign, endsWith, forEach, invert, times } from './utils';
+import { assign, endsWith, forEach, invert, times, isTypedFloatArray, isTypedUintArray, isTypedIntArray } from './utils';
 
 
 const tagName2Code = invert(fieldTagNames);
@@ -252,11 +252,17 @@ const encodeImage = (values, width, height, metadata) => {
 
   const prfx = new Uint8Array(encodeIfds([ifd]));
 
-  const img = new Uint8Array(values);
+  // This should allow other kinds of typed arrays to be used. Uint8 is just a view of the real underlying data.
+  let img = undefined
+  if (ArrayBuffer.isView(values)) { // It is a typed array
+    img = new Uint8Array(values.buffer);
+  } else { // It is a normal js array
+    img = new Uint8Array(values)
+  }
 
   const samplesPerPixel = ifd[277];
 
-  const data = new Uint8Array(numBytesInIfd + (width * height * samplesPerPixel));
+  const data = new Uint8Array(numBytesInIfd + (img.length * samplesPerPixel));
   times(prfx.length, (i) => { data[i] = prfx[i]; });
   forEach(img, (value, i) => {
     data[numBytesInIfd + i] = value;
@@ -333,9 +339,12 @@ export function writeGeotiff (data, metadata) {
   delete metadata.width;
 
   // consult https://www.loc.gov/preservation/digital/formats/content/tiff_tags.shtml
-
   if (!metadata.BitsPerSample) {
-    metadata.BitsPerSample = times(numBands, () => 8);
+    let bitsPerSample = 8
+    if (ArrayBuffer.isView(flattenedValues)) {
+      bitsPerSample = 8 * flattenedValues.BYTES_PER_ELEMENT
+    }
+    metadata.BitsPerSample = times(numBands, () => bitsPerSample);
   }
 
   metadataDefaults.forEach((tag) => {
@@ -368,7 +377,17 @@ export function writeGeotiff (data, metadata) {
   }
 
   if (!metadata.SampleFormat) {
-    metadata.SampleFormat = times(numBands, () => 1);
+    let sampleFormat = 1
+    if (isTypedFloatArray(flattenedValues)) {
+      sampleFormat = 3
+    }
+    if (isTypedIntArray(flattenedValues)) {
+      sampleFormat = 2
+    }
+    if (isTypedUintArray(flattenedValues)) {
+      sampleFormat = 1
+    }
+    metadata.SampleFormat = times(numBands, () => sampleFormat);
   }
 
 
