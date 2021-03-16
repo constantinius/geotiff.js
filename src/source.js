@@ -4,8 +4,42 @@ import http from 'http';
 import https from 'https';
 import urlMod from 'url';
 
-import { parseContentRange } from './utils';
+import { parseContentRange, AbortError } from './utils';
 
+/**
+ * Create a new AbortController whose signal depends on all input signals aborting.
+ * Credit: https://github.com/whatwg/fetch/issues/905#issuecomment-491970649
+ * @param {Array} signals An array of AbortSignals.
+ * @returns {AbortSignal} The AbortSignal dependent on all input AbortSignals.
+ */
+function allSignals(signals) {
+  if (!signals.every(Boolean)) {
+    return undefined;
+  }
+  const controller = new AbortController();
+  controller.count = signals.length;
+
+  function onAbort() {
+    controller.count -= 1;
+    if (controller.count === 0) {
+      controller.abort();
+
+      // Cleanup
+      for (const signal of signals) {
+        signal.removeEventListener('abort', onAbort);
+      }
+    }
+  }
+
+  for (const signal of signals) {
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener('abort', onAbort);
+    }
+  }
+  return controller.signal;
+}
 
 function readRangeFromBlocks(blocks, rangeOffset, rangeLength) {
   const rangeTop = rangeOffset + rangeLength;
@@ -121,6 +155,12 @@ class BlockedSource {
     // already retrieved blocks
     this.blocks = new Map();
 
+    // A map of block ids to all potential signals
+    this.signals = new Map();
+
+    // Set of aborted block ids
+    this.abortedBlockIds = new Set();
+
     // block ids waiting for a batched request. Either a Set or null
     this.blockIdsAwaitingRequest = null;
 
@@ -134,7 +174,7 @@ class BlockedSource {
    * @param {number} length The length in bytes to read from.
    * @returns {ArrayBuffer} The subset of the file.
    */
-  async fetch(offset, length, immediate = false) {
+  async fetch(offset, length, immediate = false, signal) {
     let top = offset + length;
     if (this.fileSize !== null) {
       top = Math.min(top, this.fileSize);
@@ -151,6 +191,11 @@ class BlockedSource {
       const blockId = Math.floor(current / this.blockSize);
       if (!this.blocks.has(blockId) && !this.blockRequests.has(blockId)) {
         missingBlockIds.push(blockId);
+        if (this.signals.has(blockId)) {
+          this.signals.get(blockId).push(signal);
+        } else {
+          this.signals.set(blockId, [signal]);
+        }
       }
       if (this.blockRequests.has(blockId)) {
         blockRequests.push(this.blockRequests.get(blockId));
@@ -164,8 +209,7 @@ class BlockedSource {
       this.blockIdsAwaitingRequest = new Set(missingBlockIds);
     } else {
       for (let i = 0; i < missingBlockIds.length; ++i) {
-        const id = missingBlockIds[i];
-        this.blockIdsAwaitingRequest.add(id);
+        this.blockIdsAwaitingRequest.add(missingBlockIds[i]);
       }
     }
 
@@ -183,9 +227,11 @@ class BlockedSource {
 
       // iterate over all blocks
       for (const group of groups) {
+        // Get all unique signals belonging to the group to use as one collective signal.
+        const signals = Array.from(new Set(group.map((id) => this.signals.get(id)).flat()));
         // fetch a group as in a single request
         const request = this.requestData(
-          group[0] * this.blockSize, group.length * this.blockSize,
+          group[0] * this.blockSize, group.length * this.blockSize, allSignals(signals),
         );
 
         // for each block in the request, make a small 'splitter',
@@ -196,20 +242,34 @@ class BlockedSource {
         for (let i = 0; i < group.length; ++i) {
           const id = group[i];
           this.blockRequests.set(id, (async () => {
-            const response = await request;
-            const o = i * this.blockSize;
-            const t = Math.min(o + this.blockSize, response.data.byteLength);
-            const data = response.data.slice(o, t);
-            if (this.fileSize === null && response.fileSize) {
-              this.fileSize = response.fileSize;
+            try {
+              const response = await request;
+              const o = i * this.blockSize;
+              const t = Math.min(o + this.blockSize, response.data.byteLength);
+              const data = response.data.slice(o, t);
+              if (this.fileSize === null && response.fileSize) {
+                this.fileSize = response.fileSize;
+              }
+              this.blockRequests.delete(id);
+              this.signals.delete(id);
+              this.abortedBlockIds.delete(id);
+              this.blocks.set(id, {
+                data,
+                offset: response.offset + o,
+                length: data.byteLength,
+                top: response.offset + t,
+              });
             }
-            this.blockRequests.delete(id);
-            this.blocks.set(id, {
-              data,
-              offset: response.offset + o,
-              length: data.byteLength,
-              top: response.offset + t,
-            });
+            catch (err) {
+              if (err.name === 'AbortError') {
+                this.blocks.delete(id);
+                this.blockRequests.delete(id);
+                this.signals.delete(id);
+                this.abortedBlockIds.add(id);
+              } else {
+                throw (err);
+              }
+            }
           })());
         }
       }
@@ -230,17 +290,51 @@ class BlockedSource {
 
     // now get all blocks for the request and return a summary buffer
     const blocks = allBlockIds.map((id) => this.blocks.get(id));
-    return readRangeFromBlocks(blocks, offset, length);
+    const abortedBlocksToBeRequested = [];
+    // Some of the blocks were cancelled by a signal (AbortController)
+    if (blocks.some((i) => !i)) {
+      // But not by this fetch's signal
+      if (signal && !signal.aborted) {
+        allBlockIds.forEach((blockId) => {
+          if (this.abortedBlockIds.has(blockId)) {
+            const request = this.requestData(
+              blockId * this.blockSize, this.blockSize,
+            );
+            this.blockRequests.set(blockId, (async () => {
+              const response = await request;
+              const t = Math.min(this.blockSize, response.data.byteLength);
+              const data = response.data.slice(0, t);
+              this.abortedBlockIds.delete(blockId);
+              this.blocks.set(blockId, {
+                data,
+                offset: response.offset,
+                length: data.byteLength,
+                top: response.offset + t,
+              });
+            })());
+            abortedBlocksToBeRequested.push(this.blockRequests.get(blockId));
+          }
+        });
+        // Blocks were cancelled by this signal.
+      } else if (signal && signal.aborted) {
+        throw new AbortError();
+      }
+      await Promise.all(abortedBlocksToBeRequested);
+      const blocksAndRefetchedBlocks = allBlockIds.map((id) => this.blocks.get(id));
+      return readRangeFromBlocks(blocksAndRefetchedBlocks, offset, length);
+    } else {
+      return readRangeFromBlocks(blocks, offset, length);
+    }
   }
 
-  async requestData(requestedOffset, requestedLength) {
+  async requestData(requestedOffset, requestedLength, signal) {
     let actualLengthToRequest = requestedLength;
     if (this.fileSize !== null && requestedOffset + requestedLength > this.fileSize) {
       // some HTTP servers (e.g. Aliyun OSS) do not support Range requests
       // when the Range header is longer than the actual file length
       actualLengthToRequest = this.fileSize - requestedOffset;
     }
-    const response = await this.retrievalFunction(requestedOffset, actualLengthToRequest);
+    const response = await this.retrievalFunction(requestedOffset, actualLengthToRequest, signal);
     if (!response.length) {
       response.length = response.data.byteLength;
     } else if (response.length !== response.data.byteLength) {
@@ -261,11 +355,12 @@ class BlockedSource {
  * @returns The constructed source
  */
 export function makeFetchSource(url, { headers = {}, blockSize } = {}) {
-  return new BlockedSource(async (offset, length) => {
+  return new BlockedSource(async (offset, length, signal) => {
     const response = await fetch(url, {
       headers: {
         ...headers, Range: `bytes=${offset}-${offset + length - 1}`,
       },
+      signal,
     });
 
     // check the response was okay and if the server actually understands range requests

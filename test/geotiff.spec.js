@@ -3,6 +3,7 @@ import { expect } from 'chai';
 import http from 'http';
 import serveStatic from 'serve-static';
 import finalhandler from 'finalhandler';
+import AbortController from "node-abort-controller";
 
 import { GeoTIFF, fromArrayBuffer, writeArrayBuffer, Pool, fromUrls } from '../src/geotiff';
 import { makeFetchSource, makeFileSource } from '../src/source';
@@ -262,6 +263,35 @@ describe('ifdRequestTests', () => {
       const image = await tiff.getImage(i);
       image.readRasters();
     });
+  });
+});
+
+describe("Abort signal", () => {
+  const source = "multi-channel.ome.tif";
+
+  it("Abort signal on readRasters throws exception", async () => {
+    const tiff = await GeoTIFF.fromSource(createSource(source));
+    const image = await tiff.getImage(0);
+    const abortController = new AbortController();
+    const { signal } = abortController;
+    abortController.abort();
+    try {
+      await image.readRasters({ signal });
+    } catch (e) {
+      expect(e.name).to.equal('AbortError');
+    }
+  });
+  it("Abort signal on readRGB returns fill value array", async () => {
+    const tiff = await GeoTIFF.fromSource(createSource("rgb_paletted.tiff"));
+    const image = await tiff.getImage();
+    const abortController = new AbortController();
+    const { signal } = abortController;
+    abortController.abort();
+    try {
+      await image.readRGB({ signal });
+    } catch (e) {
+      expect(e.name).to.equal('AbortError');
+    }
   });
 });
 
